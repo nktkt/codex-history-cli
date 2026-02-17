@@ -66,6 +66,24 @@ Useful flags:
 ./codex-history sessions --json
 ```
 
+### Export records (new)
+
+```bash
+# markdown to stdout
+./codex-history export --format markdown
+
+# csv to file
+./codex-history export \
+  --format csv \
+  --out /tmp/codex-history.csv \
+  --from 2026-02-17T00:00:00Z \
+  --to 2026-02-17T23:59:59Z \
+  --contains github
+
+# jsonl subset
+./codex-history export --format jsonl --session <session-id> --limit 100 --desc
+```
+
 ## Output format
 
 Each line is a JSON object:

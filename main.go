@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -108,6 +109,8 @@ func main() {
 		err = runStats(os.Args[2:])
 	case "sessions":
 		err = runSessions(os.Args[2:])
+	case "export":
+		err = runExport(os.Args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -131,6 +134,7 @@ Usage:
   codex-history show     [--in FILE] [--session ID] [--role user|assistant] [--from RFC3339] [--to RFC3339] [--contains WORD] [--limit 20] [--desc] [--json]
   codex-history stats    [--in FILE] [--session ID] [--role user|assistant] [--from RFC3339] [--to RFC3339] [--contains WORD] [--json]
   codex-history sessions [--in FILE] [--from RFC3339] [--to RFC3339] [--contains WORD] [--limit 20] [--json]
+  codex-history export   [--in FILE] [--out FILE] [--format markdown|csv|jsonl] [--session ID] [--role user|assistant] [--from RFC3339] [--to RFC3339] [--contains WORD] [--limit 20] [--desc]
 
 Defaults:
   sessions-dir: %s
@@ -435,6 +439,80 @@ func runSessions(args []string) error {
 			summary.FirstTimestamp,
 			summary.LastTimestamp,
 		)
+	}
+	return nil
+}
+
+func runExport(args []string) error {
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	inputPath := fs.String("in", defaultOutputFile(), "Input JSONL path")
+	outPath := fs.String("out", "", "Output file path (default: stdout)")
+	format := fs.String("format", "markdown", "Export format: markdown|csv|jsonl")
+	sessionID := fs.String("session", "", "Filter by session ID")
+	role := fs.String("role", "", "Filter by role: user or assistant")
+	from := fs.String("from", "", "Filter records at/after this RFC3339 timestamp")
+	to := fs.String("to", "", "Filter records at/before this RFC3339 timestamp")
+	contains := fs.String("contains", "", "Case-insensitive substring filter for text")
+	limit := fs.Int("limit", 0, "Maximum records to export, 0 means all")
+	desc := fs.Bool("desc", false, "Export newest records first")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *limit < 0 {
+		return errors.New("--limit must be >= 0")
+	}
+
+	fromTime, err := parseBoundTime(*from, "--from")
+	if err != nil {
+		return err
+	}
+	toTime, err := parseBoundTime(*to, "--to")
+	if err != nil {
+		return err
+	}
+	if err := validateTimeRange(fromTime, toTime); err != nil {
+		return err
+	}
+
+	records, err := loadRecords(*inputPath)
+	if err != nil {
+		return err
+	}
+
+	filtered := filterRecords(records, RecordFilter{
+		SessionID: strings.TrimSpace(*sessionID),
+		Role:      strings.TrimSpace(*role),
+		Contains:  strings.TrimSpace(*contains),
+		From:      fromTime,
+		To:        toTime,
+	})
+
+	sortRecordsChronological(filtered)
+	if *desc {
+		reverseRecords(filtered)
+	}
+	if *limit > 0 && len(filtered) > *limit {
+		if *desc {
+			filtered = filtered[:*limit]
+		} else {
+			filtered = filtered[len(filtered)-*limit:]
+		}
+	}
+
+	content, err := renderExport(strings.ToLower(strings.TrimSpace(*format)), filtered)
+	if err != nil {
+		return err
+	}
+
+	if err := writeOutput(*outPath, content); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(*outPath) != "" {
+		fmt.Printf("exported %d records to %s (%s)\n", len(filtered), *outPath, strings.ToLower(strings.TrimSpace(*format)))
 	}
 	return nil
 }
@@ -891,6 +969,110 @@ func reverseRecords(records []Record) {
 	for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
 		records[left], records[right] = records[right], records[left]
 	}
+}
+
+func renderExport(format string, records []Record) ([]byte, error) {
+	switch format {
+	case "markdown", "md":
+		return renderMarkdown(records), nil
+	case "csv":
+		return renderCSV(records)
+	case "jsonl":
+		return renderJSONL(records)
+	default:
+		return nil, fmt.Errorf("unsupported --format %q (use markdown, csv, or jsonl)", format)
+	}
+}
+
+func renderMarkdown(records []Record) []byte {
+	var builder strings.Builder
+	builder.WriteString("# Codex Conversation Export\n\n")
+	builder.WriteString(fmt.Sprintf("Generated: %s\n\n", time.Now().UTC().Format(time.RFC3339)))
+
+	if len(records) == 0 {
+		builder.WriteString("_No records matched._\n")
+		return []byte(builder.String())
+	}
+
+	builder.WriteString("| timestamp | session_id | role | text |\n")
+	builder.WriteString("|---|---|---|---|\n")
+	for _, record := range records {
+		builder.WriteString("| ")
+		builder.WriteString(markdownCell(record.Timestamp))
+		builder.WriteString(" | ")
+		builder.WriteString(markdownCell(record.SessionID))
+		builder.WriteString(" | ")
+		builder.WriteString(markdownCell(record.Role))
+		builder.WriteString(" | ")
+		builder.WriteString(markdownCell(record.Text))
+		builder.WriteString(" |\n")
+	}
+
+	return []byte(builder.String())
+}
+
+func renderCSV(records []Record) ([]byte, error) {
+	var builder strings.Builder
+	writer := csv.NewWriter(&builder)
+
+	header := []string{"id", "session_id", "timestamp", "role", "text", "source_file", "source_line"}
+	if err := writer.Write(header); err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		row := []string{
+			record.ID,
+			record.SessionID,
+			record.Timestamp,
+			record.Role,
+			record.Text,
+			record.SourceFile,
+			fmt.Sprintf("%d", record.SourceLine),
+		}
+		if err := writer.Write(row); err != nil {
+			return nil, err
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return nil, err
+	}
+	return []byte(builder.String()), nil
+}
+
+func renderJSONL(records []Record) ([]byte, error) {
+	var builder strings.Builder
+	encoder := json.NewEncoder(&builder)
+	encoder.SetEscapeHTML(false)
+
+	for _, record := range records {
+		if err := encoder.Encode(record); err != nil {
+			return nil, err
+		}
+	}
+	return []byte(builder.String()), nil
+}
+
+func markdownCell(value string) string {
+	out := strings.TrimSpace(value)
+	out = strings.ReplaceAll(out, "\\", "\\\\")
+	out = strings.ReplaceAll(out, "|", "\\|")
+	out = strings.ReplaceAll(out, "\n", "<br>")
+	return out
+}
+
+func writeOutput(path string, content []byte) error {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		_, err := os.Stdout.Write(content)
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(trimmed), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(trimmed, content, 0o644)
 }
 
 func shortSessionID(id string) string {

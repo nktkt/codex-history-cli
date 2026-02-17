@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/csv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,5 +175,90 @@ func TestBuildSessionSummaries(t *testing.T) {
 	}
 	if summaries[1].Total != 2 || summaries[1].User != 1 || summaries[1].Assistant != 1 {
 		t.Fatalf("unexpected s1 summary: %#v", summaries[1])
+	}
+}
+
+func TestRenderExportMarkdown(t *testing.T) {
+	records := []Record{
+		{
+			ID:        "id1",
+			SessionID: "s1",
+			Timestamp: "2026-02-17T10:00:00Z",
+			Role:      "user",
+			Text:      "hello | world\nnext",
+		},
+	}
+
+	content, err := renderExport("markdown", records)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output := string(content)
+	if !strings.Contains(output, "# Codex Conversation Export") {
+		t.Fatalf("missing markdown title: %s", output)
+	}
+	if !strings.Contains(output, "hello \\| world<br>next") {
+		t.Fatalf("expected markdown-escaped text, got: %s", output)
+	}
+}
+
+func TestRenderExportCSV(t *testing.T) {
+	records := []Record{
+		{
+			ID:         "id1",
+			SessionID:  "s1",
+			Timestamp:  "2026-02-17T10:00:00Z",
+			Role:       "assistant",
+			Text:       "hello",
+			SourceFile: "/tmp/a.jsonl",
+			SourceLine: 42,
+		},
+	}
+
+	content, err := renderExport("csv", records)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader := csv.NewReader(strings.NewReader(string(content)))
+	rows, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected header + 1 row, got %d rows", len(rows))
+	}
+	if rows[0][0] != "id" || rows[0][4] != "text" {
+		t.Fatalf("unexpected header: %#v", rows[0])
+	}
+	if rows[1][0] != "id1" || rows[1][3] != "assistant" || rows[1][6] != "42" {
+		t.Fatalf("unexpected row: %#v", rows[1])
+	}
+}
+
+func TestRenderExportJSONL(t *testing.T) {
+	records := []Record{
+		{ID: "id1", SessionID: "s1", Timestamp: "2026-02-17T10:00:00Z", Role: "user", Text: "hello"},
+		{ID: "id2", SessionID: "s1", Timestamp: "2026-02-17T10:01:00Z", Role: "assistant", Text: "hi"},
+	}
+
+	content, err := renderExport("jsonl", records)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 jsonl lines, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], `"id":"id1"`) || !strings.Contains(lines[1], `"id":"id2"`) {
+		t.Fatalf("unexpected jsonl content: %v", lines)
+	}
+}
+
+func TestRenderExportUnknownFormat(t *testing.T) {
+	if _, err := renderExport("yaml", nil); err == nil {
+		t.Fatal("expected error for unsupported format")
 	}
 }
