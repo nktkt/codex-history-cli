@@ -1,4 +1,4 @@
-codex-history
+/codex-history
+/codex-history-cli
 *.out
 .DS_Store
-

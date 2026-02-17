@@ -101,3 +101,21 @@ Each line is a JSON object:
 ```
 
 `id` is deterministic (hash of session/timestamp/role/text), so re-running `sync` does not duplicate existing records.
+
+## Multi-provider Mode (new)
+
+This repository now also includes a multi-provider history manager command:
+
+```bash
+go build -o codex-history-cli ./cmd/codex-history-cli
+```
+
+Supports:
+
+- `codex`, `ollama`, `grok`, `claude`, `gemini`
+- SQLite + FTS search
+- summary/tagging (heuristic, optional local Ollama)
+- prompt injection scoring
+- dashboard/TUI
+
+See `cmd/codex-history-cli/README.md` for details.
