@@ -47,7 +47,23 @@ Useful flags:
 ```bash
 ./codex-history show --limit 20
 ./codex-history show --session <session-id> --role user
-./codex-history show --json
+./codex-history show --contains github --from 2026-02-17T00:00:00Z --to 2026-02-17T23:59:59Z
+./codex-history show --desc --json
+```
+
+### Show aggregate stats
+
+```bash
+./codex-history stats
+./codex-history stats --session <session-id> --contains error --json
+```
+
+### List session summaries
+
+```bash
+./codex-history sessions
+./codex-history sessions --contains github --limit 10
+./codex-history sessions --json
 ```
 
 ## Output format

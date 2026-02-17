@@ -105,3 +105,74 @@ func TestSessionIDFromPath(t *testing.T) {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
 }
+
+func TestFilterRecords(t *testing.T) {
+	records := []Record{
+		{SessionID: "s1", Timestamp: "2026-02-17T12:00:00Z", Role: "user", Text: "hello world"},
+		{SessionID: "s1", Timestamp: "2026-02-17T12:01:00Z", Role: "assistant", Text: "HELLO back"},
+		{SessionID: "s2", Timestamp: "2026-02-18T12:00:00Z", Role: "user", Text: "different"},
+	}
+
+	from, _ := time.Parse(time.RFC3339, "2026-02-17T12:00:30Z")
+	to, _ := time.Parse(time.RFC3339, "2026-02-17T12:02:00Z")
+
+	filtered := filterRecords(records, RecordFilter{
+		SessionID: "s1",
+		Contains:  "hello",
+		From:      from,
+		To:        to,
+	})
+
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(filtered))
+	}
+	if filtered[0].Role != "assistant" {
+		t.Fatalf("unexpected record: %#v", filtered[0])
+	}
+}
+
+func TestComputeStats(t *testing.T) {
+	records := []Record{
+		{SessionID: "s1", Timestamp: "2026-02-17T10:00:00Z", Role: "user", Text: "a"},
+		{SessionID: "s1", Timestamp: "2026-02-17T10:01:00Z", Role: "assistant", Text: "b"},
+		{SessionID: "s2", Timestamp: "2026-02-17T10:02:00Z", Role: "other", Text: "c"},
+	}
+
+	stats := computeStats(records)
+	if stats.Total != 3 || stats.User != 1 || stats.Assistant != 1 || stats.Other != 1 {
+		t.Fatalf("unexpected stats counts: %#v", stats)
+	}
+	if stats.SessionCount != 2 {
+		t.Fatalf("expected 2 sessions, got %d", stats.SessionCount)
+	}
+	if stats.FirstTimestamp != "2026-02-17T10:00:00Z" || stats.LastTimestamp != "2026-02-17T10:02:00Z" {
+		t.Fatalf("unexpected timestamps: %#v", stats)
+	}
+}
+
+func TestBuildSessionSummaries(t *testing.T) {
+	records := []Record{
+		{SessionID: "s1", Timestamp: "2026-02-17T10:00:00Z", Role: "user", Text: "a"},
+		{SessionID: "s1", Timestamp: "2026-02-17T10:01:00Z", Role: "assistant", Text: "b"},
+		{SessionID: "s2", Timestamp: "2026-02-17T11:00:00Z", Role: "user", Text: "c"},
+	}
+
+	summaries := buildSessionSummaries(records)
+	if len(summaries) != 2 {
+		t.Fatalf("expected 2 session summaries, got %d", len(summaries))
+	}
+
+	if summaries[0].SessionID != "s2" {
+		t.Fatalf("expected latest session first, got %q", summaries[0].SessionID)
+	}
+	if summaries[0].Total != 1 || summaries[0].User != 1 {
+		t.Fatalf("unexpected s2 summary: %#v", summaries[0])
+	}
+
+	if summaries[1].SessionID != "s1" {
+		t.Fatalf("expected second session s1, got %q", summaries[1].SessionID)
+	}
+	if summaries[1].Total != 2 || summaries[1].User != 1 || summaries[1].Assistant != 1 {
+		t.Fatalf("unexpected s1 summary: %#v", summaries[1])
+	}
+}

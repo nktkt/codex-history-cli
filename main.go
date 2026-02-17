@@ -62,6 +62,34 @@ type SyncResult struct {
 	Written int
 }
 
+type RecordFilter struct {
+	SessionID string
+	Role      string
+	Contains  string
+	From      time.Time
+	To        time.Time
+}
+
+type HistoryStats struct {
+	Total          int    `json:"total"`
+	User           int    `json:"user"`
+	Assistant      int    `json:"assistant"`
+	Other          int    `json:"other"`
+	SessionCount   int    `json:"session_count"`
+	FirstTimestamp string `json:"first_timestamp,omitempty"`
+	LastTimestamp  string `json:"last_timestamp,omitempty"`
+}
+
+type SessionSummary struct {
+	SessionID      string `json:"session_id"`
+	Total          int    `json:"total"`
+	User           int    `json:"user"`
+	Assistant      int    `json:"assistant"`
+	Other          int    `json:"other"`
+	FirstTimestamp string `json:"first_timestamp,omitempty"`
+	LastTimestamp  string `json:"last_timestamp,omitempty"`
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -76,6 +104,10 @@ func main() {
 		err = runWatch(os.Args[2:])
 	case "show":
 		err = runShow(os.Args[2:])
+	case "stats":
+		err = runStats(os.Args[2:])
+	case "sessions":
+		err = runSessions(os.Args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -94,9 +126,11 @@ func printUsage() {
 	fmt.Printf(`codex-history: record Codex conversations from ~/.codex/sessions
 
 Usage:
-  codex-history sync  [--sessions-dir DIR] [--out FILE] [--from RFC3339] [--dry-run]
-  codex-history watch [--sessions-dir DIR] [--out FILE] [--from RFC3339] [--interval 5s]
-  codex-history show  [--in FILE] [--session ID] [--role user|assistant] [--limit 20] [--json]
+  codex-history sync     [--sessions-dir DIR] [--out FILE] [--from RFC3339] [--dry-run]
+  codex-history watch    [--sessions-dir DIR] [--out FILE] [--from RFC3339] [--interval 5s]
+  codex-history show     [--in FILE] [--session ID] [--role user|assistant] [--from RFC3339] [--to RFC3339] [--contains WORD] [--limit 20] [--desc] [--json]
+  codex-history stats    [--in FILE] [--session ID] [--role user|assistant] [--from RFC3339] [--to RFC3339] [--contains WORD] [--json]
+  codex-history sessions [--in FILE] [--from RFC3339] [--to RFC3339] [--contains WORD] [--limit 20] [--json]
 
 Defaults:
   sessions-dir: %s
@@ -133,7 +167,7 @@ func runSync(args []string) error {
 		return err
 	}
 
-	since, err := parseFromTime(*from)
+	since, err := parseBoundTime(*from, "--from")
 	if err != nil {
 		return err
 	}
@@ -169,7 +203,7 @@ func runWatch(args []string) error {
 		return errors.New("interval must be > 0")
 	}
 
-	since, err := parseFromTime(*from)
+	since, err := parseBoundTime(*from, "--from")
 	if err != nil {
 		return err
 	}
@@ -215,11 +249,27 @@ func runShow(args []string) error {
 	inputPath := fs.String("in", defaultOutputFile(), "Input JSONL path")
 	sessionID := fs.String("session", "", "Filter by session ID")
 	role := fs.String("role", "", "Filter by role: user or assistant")
+	from := fs.String("from", "", "Filter records at/after this RFC3339 timestamp")
+	to := fs.String("to", "", "Filter records at/before this RFC3339 timestamp")
+	contains := fs.String("contains", "", "Case-insensitive substring filter for text")
 	limit := fs.Int("limit", 20, "Maximum records to print, 0 means all")
+	desc := fs.Bool("desc", false, "Show newest records first")
 	jsonOut := fs.Bool("json", false, "Print as JSONL")
 	maxChars := fs.Int("max-chars", 140, "Max chars per message line, 0 means no truncation")
 
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	fromTime, err := parseBoundTime(*from, "--from")
+	if err != nil {
+		return err
+	}
+	toTime, err := parseBoundTime(*to, "--to")
+	if err != nil {
+		return err
+	}
+	if err := validateTimeRange(fromTime, toTime); err != nil {
 		return err
 	}
 
@@ -228,19 +278,25 @@ func runShow(args []string) error {
 		return err
 	}
 
-	filtered := make([]Record, 0, len(records))
-	for _, record := range records {
-		if *sessionID != "" && record.SessionID != *sessionID {
-			continue
-		}
-		if *role != "" && record.Role != *role {
-			continue
-		}
-		filtered = append(filtered, record)
+	filtered := filterRecords(records, RecordFilter{
+		SessionID: strings.TrimSpace(*sessionID),
+		Role:      strings.TrimSpace(*role),
+		Contains:  strings.TrimSpace(*contains),
+		From:      fromTime,
+		To:        toTime,
+	})
+
+	sortRecordsChronological(filtered)
+	if *desc {
+		reverseRecords(filtered)
 	}
 
 	if *limit > 0 && len(filtered) > *limit {
-		filtered = filtered[len(filtered)-*limit:]
+		if *desc {
+			filtered = filtered[:*limit]
+		} else {
+			filtered = filtered[len(filtered)-*limit:]
+		}
 	}
 
 	if *jsonOut {
@@ -261,16 +317,146 @@ func runShow(args []string) error {
 	return nil
 }
 
-func parseFromTime(from string) (time.Time, error) {
-	if strings.TrimSpace(from) == "" {
+func runStats(args []string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	inputPath := fs.String("in", defaultOutputFile(), "Input JSONL path")
+	sessionID := fs.String("session", "", "Filter by session ID")
+	role := fs.String("role", "", "Filter by role: user or assistant")
+	from := fs.String("from", "", "Filter records at/after this RFC3339 timestamp")
+	to := fs.String("to", "", "Filter records at/before this RFC3339 timestamp")
+	contains := fs.String("contains", "", "Case-insensitive substring filter for text")
+	jsonOut := fs.Bool("json", false, "Print as JSON")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	fromTime, err := parseBoundTime(*from, "--from")
+	if err != nil {
+		return err
+	}
+	toTime, err := parseBoundTime(*to, "--to")
+	if err != nil {
+		return err
+	}
+	if err := validateTimeRange(fromTime, toTime); err != nil {
+		return err
+	}
+
+	records, err := loadRecords(*inputPath)
+	if err != nil {
+		return err
+	}
+
+	filtered := filterRecords(records, RecordFilter{
+		SessionID: strings.TrimSpace(*sessionID),
+		Role:      strings.TrimSpace(*role),
+		Contains:  strings.TrimSpace(*contains),
+		From:      fromTime,
+		To:        toTime,
+	})
+
+	stats := computeStats(filtered)
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		return enc.Encode(stats)
+	}
+
+	fmt.Printf("total=%d\n", stats.Total)
+	fmt.Printf("user=%d\n", stats.User)
+	fmt.Printf("assistant=%d\n", stats.Assistant)
+	fmt.Printf("other=%d\n", stats.Other)
+	fmt.Printf("session_count=%d\n", stats.SessionCount)
+	fmt.Printf("first_timestamp=%s\n", stats.FirstTimestamp)
+	fmt.Printf("last_timestamp=%s\n", stats.LastTimestamp)
+	return nil
+}
+
+func runSessions(args []string) error {
+	fs := flag.NewFlagSet("sessions", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	inputPath := fs.String("in", defaultOutputFile(), "Input JSONL path")
+	from := fs.String("from", "", "Filter records at/after this RFC3339 timestamp")
+	to := fs.String("to", "", "Filter records at/before this RFC3339 timestamp")
+	contains := fs.String("contains", "", "Case-insensitive substring filter for text")
+	limit := fs.Int("limit", 20, "Maximum sessions to print, 0 means all")
+	jsonOut := fs.Bool("json", false, "Print as JSON")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	fromTime, err := parseBoundTime(*from, "--from")
+	if err != nil {
+		return err
+	}
+	toTime, err := parseBoundTime(*to, "--to")
+	if err != nil {
+		return err
+	}
+	if err := validateTimeRange(fromTime, toTime); err != nil {
+		return err
+	}
+
+	records, err := loadRecords(*inputPath)
+	if err != nil {
+		return err
+	}
+
+	filtered := filterRecords(records, RecordFilter{
+		Contains: strings.TrimSpace(*contains),
+		From:     fromTime,
+		To:       toTime,
+	})
+
+	summaries := buildSessionSummaries(filtered)
+	if *limit > 0 && len(summaries) > *limit {
+		summaries = summaries[:*limit]
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		return enc.Encode(summaries)
+	}
+
+	for _, summary := range summaries {
+		fmt.Printf("%s total=%d user=%d assistant=%d other=%d first=%s last=%s\n",
+			summary.SessionID,
+			summary.Total,
+			summary.User,
+			summary.Assistant,
+			summary.Other,
+			summary.FirstTimestamp,
+			summary.LastTimestamp,
+		)
+	}
+	return nil
+}
+
+func parseBoundTime(raw string, flagName string) (time.Time, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return time.Time{}, nil
 	}
 
-	ts, err := time.Parse(time.RFC3339, from)
+	ts, err := time.Parse(time.RFC3339, trimmed)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid --from value %q: expected RFC3339", from)
+		return time.Time{}, fmt.Errorf("invalid %s value %q: expected RFC3339", flagName, raw)
 	}
 	return ts.UTC(), nil
+}
+
+func validateTimeRange(from, to time.Time) error {
+	if !from.IsZero() && !to.IsZero() && from.After(to) {
+		return errors.New("--from must be before or equal to --to")
+	}
+	return nil
 }
 
 func syncOnce(opts SyncOptions) (SyncResult, error) {
@@ -390,7 +576,7 @@ func extractRecords(path string, since time.Time) ([]Record, error) {
 
 			timestamp := normalizeTimestamp(item.Timestamp)
 			if !since.IsZero() {
-				if parsed, err := time.Parse(time.RFC3339Nano, timestamp); err == nil && parsed.Before(since) {
+				if parsed, ok := parseRecordTime(timestamp); ok && parsed.Before(since) {
 					continue
 				}
 			}
@@ -419,10 +605,7 @@ func normalizeTimestamp(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if t, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
-		return t.UTC().Format(time.RFC3339Nano)
-	}
-	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
+	if t, ok := parseRecordTime(trimmed); ok {
 		return t.UTC().Format(time.RFC3339Nano)
 	}
 	return trimmed
@@ -530,6 +713,184 @@ func loadRecords(path string) ([]Record, error) {
 		return nil, err
 	}
 	return records, nil
+}
+
+func filterRecords(records []Record, filter RecordFilter) []Record {
+	sessionID := strings.TrimSpace(filter.SessionID)
+	role := strings.ToLower(strings.TrimSpace(filter.Role))
+	contains := strings.ToLower(strings.TrimSpace(filter.Contains))
+
+	filtered := make([]Record, 0, len(records))
+	for _, record := range records {
+		if sessionID != "" && record.SessionID != sessionID {
+			continue
+		}
+		if role != "" && strings.ToLower(strings.TrimSpace(record.Role)) != role {
+			continue
+		}
+		if contains != "" && !strings.Contains(strings.ToLower(record.Text), contains) {
+			continue
+		}
+		if !filter.From.IsZero() || !filter.To.IsZero() {
+			ts, ok := parseRecordTime(record.Timestamp)
+			if !ok {
+				continue
+			}
+			if !filter.From.IsZero() && ts.Before(filter.From) {
+				continue
+			}
+			if !filter.To.IsZero() && ts.After(filter.To) {
+				continue
+			}
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered
+}
+
+func computeStats(records []Record) HistoryStats {
+	stats := HistoryStats{Total: len(records)}
+	sessionSet := make(map[string]struct{})
+
+	for _, record := range records {
+		sessionSet[record.SessionID] = struct{}{}
+		switch strings.ToLower(strings.TrimSpace(record.Role)) {
+		case "user":
+			stats.User++
+		case "assistant":
+			stats.Assistant++
+		default:
+			stats.Other++
+		}
+
+		stats.FirstTimestamp = earlierTimestamp(stats.FirstTimestamp, record.Timestamp)
+		stats.LastTimestamp = laterTimestamp(stats.LastTimestamp, record.Timestamp)
+	}
+
+	stats.SessionCount = len(sessionSet)
+	return stats
+}
+
+func buildSessionSummaries(records []Record) []SessionSummary {
+	summaryBySession := make(map[string]*SessionSummary)
+
+	for _, record := range records {
+		sessionID := record.SessionID
+		if strings.TrimSpace(sessionID) == "" {
+			sessionID = "unknown"
+		}
+
+		summary, exists := summaryBySession[sessionID]
+		if !exists {
+			summary = &SessionSummary{SessionID: sessionID}
+			summaryBySession[sessionID] = summary
+		}
+
+		summary.Total++
+		switch strings.ToLower(strings.TrimSpace(record.Role)) {
+		case "user":
+			summary.User++
+		case "assistant":
+			summary.Assistant++
+		default:
+			summary.Other++
+		}
+
+		summary.FirstTimestamp = earlierTimestamp(summary.FirstTimestamp, record.Timestamp)
+		summary.LastTimestamp = laterTimestamp(summary.LastTimestamp, record.Timestamp)
+	}
+
+	summaries := make([]SessionSummary, 0, len(summaryBySession))
+	for _, summary := range summaryBySession {
+		summaries = append(summaries, *summary)
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		cmp := compareTimestamp(summaries[i].LastTimestamp, summaries[j].LastTimestamp)
+		if cmp != 0 {
+			return cmp > 0
+		}
+		return summaries[i].SessionID < summaries[j].SessionID
+	})
+
+	return summaries
+}
+
+func parseRecordTime(value string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed.UTC(), true
+	}
+	if parsed, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return parsed.UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func compareTimestamp(left, right string) int {
+	leftTime, leftOK := parseRecordTime(left)
+	rightTime, rightOK := parseRecordTime(right)
+
+	if leftOK && rightOK {
+		if leftTime.Before(rightTime) {
+			return -1
+		}
+		if leftTime.After(rightTime) {
+			return 1
+		}
+		return strings.Compare(left, right)
+	}
+
+	if leftOK != rightOK {
+		if leftOK {
+			return 1
+		}
+		return -1
+	}
+
+	return strings.Compare(left, right)
+}
+
+func earlierTimestamp(current, candidate string) string {
+	if strings.TrimSpace(candidate) == "" {
+		return current
+	}
+	if strings.TrimSpace(current) == "" {
+		return candidate
+	}
+	if compareTimestamp(candidate, current) < 0 {
+		return candidate
+	}
+	return current
+}
+
+func laterTimestamp(current, candidate string) string {
+	if strings.TrimSpace(candidate) == "" {
+		return current
+	}
+	if strings.TrimSpace(current) == "" {
+		return candidate
+	}
+	if compareTimestamp(candidate, current) > 0 {
+		return candidate
+	}
+	return current
+}
+
+func sortRecordsChronological(records []Record) {
+	sort.SliceStable(records, func(i, j int) bool {
+		return compareTimestamp(records[i].Timestamp, records[j].Timestamp) < 0
+	})
+}
+
+func reverseRecords(records []Record) {
+	for left, right := 0, len(records)-1; left < right; left, right = left+1, right-1 {
+		records[left], records[right] = records[right], records[left]
+	}
 }
 
 func shortSessionID(id string) string {
